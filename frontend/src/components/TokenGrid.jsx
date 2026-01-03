@@ -1,6 +1,8 @@
 import TokenCard from "./TokenCard";
 
 function TokenGrid({ tokens, formatBalance }) {
+  console.log("TokenGrid received tokens:", tokens);
+
   if (tokens.length === 0) {
     return null;
   }
