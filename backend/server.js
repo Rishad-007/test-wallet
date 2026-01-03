@@ -9,6 +9,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const ALCHEMY_URL = `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`;
+
+// Helper function to call Alchemy API
+async function callAlchemy(method, params) {
+  const response = await fetch(ALCHEMY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method,
+      params,
+      id: 1,
+    }),
+  });
+  return response.json();
+}
+
+// Get wallet portfolio with token balances
 app.post("/portfolio", async (req, res) => {
   const { address } = req.body;
 
@@ -17,55 +35,26 @@ app.post("/portfolio", async (req, res) => {
   }
 
   try {
-    // Get token balances
-    const balancesResponse = await fetch(
-      `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "alchemy_getTokenBalances",
-          params: [address, "erc20"],
-          id: 1,
-        }),
-      }
-    );
+    // Step 1: Get all token balances
+    const balancesData = await callAlchemy("alchemy_getTokenBalances", [
+      address,
+      "erc20",
+    ]);
 
-    const balancesData = await balancesResponse.json();
-    console.log("Balances data:", balancesData);
-
-    // Filter tokens with non-zero balance
+    // Step 2: Filter tokens that have a balance
     const tokensWithBalance = balancesData.result.tokenBalances.filter(
       (token) => parseInt(token.tokenBalance, 16) > 0
     );
-    console.log("Tokens with balance:", tokensWithBalance.length);
 
-    // Fetch metadata for each token
-    const metadataPromises = tokensWithBalance.map(async (token) => {
-      const metadataResponse = await fetch(
-        `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "alchemy_getTokenMetadata",
-            params: [token.contractAddress],
-            id: 1,
-          }),
-        }
-      );
-      const metadata = await metadataResponse.json();
-      console.log("Metadata for", token.contractAddress, ":", metadata);
-      return {
-        ...token,
-        tokenMetadata: metadata.result,
-      };
-    });
-
-    const tokensWithMetadata = await Promise.all(metadataPromises);
-    console.log("Final tokens with metadata:", tokensWithMetadata);
+    // Step 3: Get metadata (name, symbol, decimals) for each token
+    const tokensWithMetadata = await Promise.all(
+      tokensWithBalance.map(async (token) => {
+        const metadata = await callAlchemy("alchemy_getTokenMetadata", [
+          token.contractAddress,
+        ]);
+        return { ...token, tokenMetadata: metadata.result };
+      })
+    );
 
     res.json({
       jsonrpc: "2.0",
@@ -76,13 +65,14 @@ app.post("/portfolio", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error:", error.message);
+    console.error("Portfolio error:", error.message);
     res
       .status(500)
-      .json({ error: "Alchemy API failed", details: error.message });
+      .json({ error: "Failed to fetch portfolio", details: error.message });
   }
 });
 
+// Get wallet transaction history
 app.post("/transactions", async (req, res) => {
   const { address } = req.body;
 
@@ -91,79 +81,42 @@ app.post("/transactions", async (req, res) => {
   }
 
   try {
-    // Fetch sent transactions
-    const sentResponse = await fetch(
-      `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "alchemy_getAssetTransfers",
-          params: [
-            {
-              fromBlock: "0x0",
-              toBlock: "latest",
-              fromAddress: address,
-              category: ["external", "internal", "erc20", "erc721", "erc1155"],
-              maxCount: "0x19",
-              order: "desc",
-            },
-          ],
-        }),
-      }
-    );
+    const transferParams = {
+      fromBlock: "0x0",
+      toBlock: "latest",
+      category: ["external", "internal", "erc20", "erc721", "erc1155"],
+      maxCount: "0x19",
+      order: "desc",
+    };
 
-    // Fetch received transactions
-    const receivedResponse = await fetch(
-      `https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 2,
-          method: "alchemy_getAssetTransfers",
-          params: [
-            {
-              fromBlock: "0x0",
-              toBlock: "latest",
-              toAddress: address,
-              category: ["external", "internal", "erc20", "erc721", "erc1155"],
-              maxCount: "0x19",
-              order: "desc",
-            },
-          ],
-        }),
-      }
-    );
+    // Fetch sent and received transactions in parallel
+    const [sentData, receivedData] = await Promise.all([
+      callAlchemy("alchemy_getAssetTransfers", [
+        { ...transferParams, fromAddress: address },
+      ]),
+      callAlchemy("alchemy_getAssetTransfers", [
+        { ...transferParams, toAddress: address },
+      ]),
+    ]);
 
-    const sentData = await sentResponse.json();
-    const receivedData = await receivedResponse.json();
-
-    // Combine and sort by block number
+    // Combine and sort all transactions by block number (newest first)
     const allTransfers = [
       ...(sentData?.result?.transfers || []),
       ...(receivedData?.result?.transfers || []),
-    ].sort((a, b) => {
-      const blockA = parseInt(a.blockNum, 16);
-      const blockB = parseInt(b.blockNum, 16);
-      return blockB - blockA; // Descending order
-    });
+    ].sort((a, b) => parseInt(b.blockNum, 16) - parseInt(a.blockNum, 16));
 
     res.json({
       jsonrpc: "2.0",
       id: 1,
       result: {
-        transfers: allTransfers.slice(0, 50), // Limit to 50 total
+        transfers: allTransfers.slice(0, 50), // Return top 50 transactions
       },
     });
   } catch (error) {
-    console.error("Error:", error.message);
+    console.error("Transaction error:", error.message);
     res
       .status(500)
-      .json({ error: "Alchemy API failed", details: error.message });
+      .json({ error: "Failed to fetch transactions", details: error.message });
   }
 });
 
